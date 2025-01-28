@@ -20,7 +20,7 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 from torch import nn
-
+from collections import namedtuple
 from ..api import ModelArgs
 
 # **NOTE**: This code is not runnable without installing `torch` and `fairscale`
@@ -111,6 +111,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+AttentionValues = namedtuple('AttentionValues', ['attention_output', 'attention_weights'])
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -174,6 +175,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        return_attn: bool = False
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -211,8 +213,16 @@ class Attention(nn.Module):
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output_per_head = output
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+
+        if not return_attn:
+            return self.wo(output)
+        else:
+            return self.wo(output), AttentionValues(
+                attention_output=output_per_head,
+                attention_weights=scores
+            )
 
 
 class FeedForward(nn.Module):
@@ -267,10 +277,19 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        return_attn: bool = False
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        attn = None
+        if return_attn:
+            y, attn = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, return_attn=True)
+            h = x + y
+        else:
+            h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, return_attn=False)
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        if return_attn:
+            return out, attn
+        else:
+            return out
 
 
 class Transformer(nn.Module):
@@ -301,7 +320,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, return_attn: bool = False):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -326,9 +345,19 @@ class Transformer(nn.Module):
             mask = torch.hstack(
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
-
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+        
+        attns = []
+        print("forward ...")
+        for (idx, layer) in enumerate(self.layers):
+            if return_attn:
+                # print(f"\t layer: {idx}")
+                h, a = layer(h, start_pos, freqs_cis, mask, return_attn=return_attn)
+                attns.append(a)
+            else:
+                h = layer(h, start_pos, freqs_cis, mask, return_attn=return_attn)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        if return_attn:
+            return output, attns
+        else:
+            return output

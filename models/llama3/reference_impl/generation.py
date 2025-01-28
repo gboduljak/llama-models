@@ -20,7 +20,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, List, Optional
+from typing import Dict, Generator, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +43,7 @@ class CompletionPrediction:
     generation: str
     decoded_tokens: Optional[List[str]] = None
     logprobs: Optional[List[List[float]]] = None
+    attns: Optional[Dict[str, torch.Tensor]] = None
 
 
 @dataclass
@@ -50,6 +51,7 @@ class ChatPrediction:
     generation: RawMessage
     decoded_tokens: Optional[List[str]] = None
     logprobs: Optional[List[List[float]]] = None
+    attns: Optional[Dict[str, torch.Tensor]] = None
 
 
 @dataclass
@@ -57,6 +59,7 @@ class TokenResult:
     token: int
     text: str
     logprobs: Optional[List[float]] = None
+    attns: Optional[Dict[str, torch.Tensor]] = None
 
 
 class Llama:
@@ -164,6 +167,7 @@ class Llama:
         logprobs: bool = False,
         echo: bool = False,
         print_model_input: bool = False,
+        return_attn: bool = False
     ) -> Generator:
         params = self.model.params
 
@@ -228,7 +232,9 @@ class Llama:
                 )
 
         stop_tokens = torch.tensor(self.tokenizer.stop_tokens)
-        for cur_pos in range(min_prompt_len, total_len):
+        for (idx, cur_pos) in enumerate(range(min_prompt_len, total_len)):
+            attns = None
+            print(f"doing forward #{idx}...")
             if is_vision:
                 position_ids = torch.arange(
                     prev_pos, cur_pos, dtype=torch.long, device="cuda"
@@ -243,8 +249,11 @@ class Llama:
                     text_only_inference,
                 )
             else:
-                logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-
+                logits, attns = self.model.forward(
+                    tokens[:, prev_pos:cur_pos],
+                    prev_pos,
+                    return_attn=return_attn
+                )
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -289,6 +298,7 @@ class Llama:
                     if logprobs
                     else None
                 ),
+                attns=attns
             )
 
             prev_pos = cur_pos
@@ -303,6 +313,7 @@ class Llama:
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
         echo: bool = False,
+        return_attn: bool = False
     ) -> CompletionPrediction:
         if (
             max_gen_len is None
@@ -316,6 +327,8 @@ class Llama:
         tokens = []
         token_logprobs = []
         decoded_tokens = []
+        attns = []
+
         for result in self.generate(
             model_input=model_input,
             max_gen_len=max_gen_len,
@@ -323,11 +336,13 @@ class Llama:
             top_p=top_p,
             logprobs=logprobs,
             echo=echo,
+            return_attn=return_attn
         ):
             tokens.append(result.token)
             if logprobs:
                 decoded_tokens.append(result.text)
                 token_logprobs.append(result.logprobs)
+            attns.append(result.attns)
 
         generation = self.tokenizer.decode(tokens)
         if logprobs:
@@ -336,9 +351,14 @@ class Llama:
                 logprobs=token_logprobs,
                 decoded_tokens=decoded_tokens,
             )
-
+        if return_attn:
+            return CompletionPrediction(
+                generation=generation,
+                attns=attns
+            )
+    
         return CompletionPrediction(generation=generation)
-
+        
     def chat_completion(
         self,
         messages: List[RawMessage],
